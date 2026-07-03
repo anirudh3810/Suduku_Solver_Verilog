@@ -1,234 +1,260 @@
-`timescale 1ns/1ps
-`default_nettype none
+`timescale 1ns / 1ps
 
-module sudoku_solver (
-    input  wire         clk,
-    input  wire         rst,
-    input  wire         start,
-    input  wire [323:0] puzzle_flat,
-    output reg  [323:0] solution_flat,
-    output reg          done,
-    output reg          valid,
-    output reg          busy
+// Sequential 9x9 Sudoku solver.
+//
+// Input encoding:
+//   puzzle_in[cell*4 +: 4] holds one cell, where cell = row*9 + column.
+//   0 means blank, 1..9 are fixed givens. Values 10..15 are rejected.
+//
+// Output encoding:
+//   solution_out uses the same packing after done=1 and solved=1.
+//
+// The core uses deterministic depth-first backtracking. It is intentionally
+// compact and easy to integrate: pulse start high for one clock, then wait for
+// done. If the puzzle is valid and solvable, solved will be high.
+module sudoku_solver #(
+    parameter MAX_CYCLES = 32'd10000000
+) (
+    input  wire        clk,
+    input  wire        reset,
+    input  wire        start,
+    input  wire [323:0] puzzle_in,
+    output reg         done,
+    output reg         solved,
+    output reg         invalid,
+    output reg  [323:0] solution_out,
+    output reg  [31:0] cycles
 );
 
-    localparam [2:0] ST_IDLE     = 3'd0;
-    localparam [2:0] ST_LOAD     = 3'd1;
-    localparam [2:0] ST_VALIDATE = 3'd2;
-    localparam [2:0] ST_SOLVE    = 3'd3;
-    localparam [2:0] ST_DONE     = 3'd4;
-    localparam [2:0] ST_FAIL     = 3'd5;
+    localparam S_IDLE           = 4'd0;
+    localparam S_CHECK_INPUT    = 4'd1;
+    localparam S_VALIDATE       = 4'd2;
+    localparam S_SOLVE          = 4'd3;
+    localparam S_TRY_VALUE      = 4'd4;
+    localparam S_BACKTRACK      = 4'd5;
+    localparam S_BACKTRACK_SKIP = 4'd6;
+    localparam S_PACK_OUTPUT    = 4'd7;
+    localparam S_DONE           = 4'd8;
 
-    reg [2:0] state;
-
-    reg [3:0] board      [0:80];
+    reg [3:0] grid [0:80];
     reg       fixed_cell [0:80];
-    reg [6:0] empty_pos  [0:80];
-    reg [3:0] next_digit [0:80];
 
-    reg [6:0] empty_count;
-    reg [6:0] sp;
-    reg [6:0] load_idx;
-    reg [6:0] check_idx;
+    reg [3:0] state;
+    reg [6:0] idx;
+    reg [6:0] validate_idx;
+    reg [3:0] try_value;
+    reg       input_bad;
 
-    integer init_i;
-    integer pack_i;
+    integer i;
 
-    function is_placement_valid;
-        input [6:0] cell_index;
-        input [3:0] digit;
+    function is_legal;
+        input [6:0] pos;
+        input [3:0] value;
         integer row;
         integer col;
-        integer base_row;
-        integer base_col;
-        integer rr;
-        integer cc;
-        integer peer;
+        integer box_row;
+        integer box_col;
+        integer j;
+        integer check_pos;
         begin
-            is_placement_valid = 1'b1;
+            is_legal = 1'b1;
 
-            if (digit == 4'd0) begin
-                is_placement_valid = 1'b0;
+            if (value < 4'd1 || value > 4'd9) begin
+                is_legal = 1'b0;
             end else begin
-                row = cell_index / 9;
-                col = cell_index % 9;
+                row = pos / 9;
+                col = pos % 9;
 
-                for (cc = 0; cc < 9; cc = cc + 1) begin
-                    peer = (row * 9) + cc;
-                    if ((peer != cell_index) && (board[peer] == digit)) begin
-                        is_placement_valid = 1'b0;
+                for (j = 0; j < 9; j = j + 1) begin
+                    check_pos = row * 9 + j;
+                    if (check_pos != pos && grid[check_pos] == value) begin
+                        is_legal = 1'b0;
                     end
                 end
 
-                for (rr = 0; rr < 9; rr = rr + 1) begin
-                    peer = (rr * 9) + col;
-                    if ((peer != cell_index) && (board[peer] == digit)) begin
-                        is_placement_valid = 1'b0;
+                for (j = 0; j < 9; j = j + 1) begin
+                    check_pos = j * 9 + col;
+                    if (check_pos != pos && grid[check_pos] == value) begin
+                        is_legal = 1'b0;
                     end
                 end
 
-                base_row = (row / 3) * 3;
-                base_col = (col / 3) * 3;
-
-                for (rr = 0; rr < 3; rr = rr + 1) begin
-                    for (cc = 0; cc < 3; cc = cc + 1) begin
-                        peer = ((base_row + rr) * 9) + (base_col + cc);
-                        if ((peer != cell_index) && (board[peer] == digit)) begin
-                            is_placement_valid = 1'b0;
-                        end
+                box_row = (row / 3) * 3;
+                box_col = (col / 3) * 3;
+                for (j = 0; j < 9; j = j + 1) begin
+                    check_pos = (box_row + (j / 3)) * 9 + box_col + (j % 3);
+                    if (check_pos != pos && grid[check_pos] == value) begin
+                        is_legal = 1'b0;
                     end
                 end
             end
         end
     endfunction
 
-    always @(*) begin
-        solution_flat = {324{1'b0}};
-        for (pack_i = 0; pack_i < 81; pack_i = pack_i + 1) begin
-            solution_flat[(pack_i * 4) +: 4] = board[pack_i];
-        end
-    end
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            state        <= S_IDLE;
+            done         <= 1'b0;
+            solved       <= 1'b0;
+            invalid      <= 1'b0;
+            solution_out <= 324'd0;
+            cycles       <= 32'd0;
+            idx          <= 7'd0;
+            validate_idx <= 7'd0;
+            try_value    <= 4'd0;
+            input_bad    <= 1'b0;
 
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            state      <= ST_IDLE;
-            done       <= 1'b0;
-            valid      <= 1'b0;
-            busy       <= 1'b0;
-            empty_count <= 7'd0;
-            sp         <= 7'd0;
-            load_idx   <= 7'd0;
-            check_idx  <= 7'd0;
-
-            for (init_i = 0; init_i < 81; init_i = init_i + 1) begin
-                board[init_i]      <= 4'd0;
-                fixed_cell[init_i] <= 1'b0;
-                empty_pos[init_i]  <= 7'd0;
-                next_digit[init_i] <= 4'd1;
+            for (i = 0; i < 81; i = i + 1) begin
+                grid[i]       <= 4'd0;
+                fixed_cell[i] <= 1'b0;
             end
         end else begin
             case (state)
-                ST_IDLE: begin
-                    done  <= 1'b0;
-                    valid <= 1'b0;
-                    busy  <= 1'b0;
-
+                S_IDLE: begin
                     if (start) begin
-                        done        <= 1'b0;
-                        valid       <= 1'b1;
-                        busy        <= 1'b1;
-                        empty_count <= 7'd0;
-                        sp          <= 7'd0;
-                        load_idx    <= 7'd0;
-                        check_idx   <= 7'd0;
-                        state       <= ST_LOAD;
+                        done         <= 1'b0;
+                        solved       <= 1'b0;
+                        invalid      <= 1'b0;
+                        solution_out <= 324'd0;
+                        cycles       <= 32'd0;
+                        idx          <= 7'd0;
+                        validate_idx <= 7'd0;
+                        try_value    <= 4'd0;
+                        input_bad    <= 1'b0;
 
-                        for (init_i = 0; init_i < 81; init_i = init_i + 1) begin
-                            board[init_i]      <= 4'd0;
-                            fixed_cell[init_i] <= 1'b0;
-                            empty_pos[init_i]  <= 7'd0;
-                            next_digit[init_i] <= 4'd1;
+                        for (i = 0; i < 81; i = i + 1) begin
+                            grid[i]       <= puzzle_in[i*4 +: 4];
+                            fixed_cell[i] <= (puzzle_in[i*4 +: 4] != 4'd0);
+                            if (puzzle_in[i*4 +: 4] > 4'd9) begin
+                                input_bad <= 1'b1;
+                            end
                         end
+
+                        state <= S_CHECK_INPUT;
                     end
                 end
 
-                ST_LOAD: begin
-                    board[load_idx]      <= puzzle_flat[(load_idx * 4) +: 4];
-                    fixed_cell[load_idx] <= (puzzle_flat[(load_idx * 4) +: 4] != 4'd0);
-
-                    if (puzzle_flat[(load_idx * 4) +: 4] == 4'd0) begin
-                        empty_pos[empty_count]  <= load_idx;
-                        next_digit[empty_count] <= 4'd1;
-                        empty_count             <= empty_count + 7'd1;
-                    end
-
-                    if (load_idx == 7'd80) begin
-                        check_idx <= 7'd0;
-                        state     <= ST_VALIDATE;
+                S_CHECK_INPUT: begin
+                    cycles <= cycles + 32'd1;
+                    if (input_bad) begin
+                        invalid <= 1'b1;
+                        solved  <= 1'b0;
+                        done    <= 1'b1;
+                        state   <= S_DONE;
                     end else begin
-                        load_idx <= load_idx + 7'd1;
+                        state <= S_VALIDATE;
                     end
                 end
 
-                ST_VALIDATE: begin
-                    if ((board[check_idx] != 4'd0) && !is_placement_valid(check_idx, board[check_idx])) begin
-                        done  <= 1'b1;
-                        valid <= 1'b0;
-                        busy  <= 1'b0;
-                        state <= ST_FAIL;
-                    end else if (check_idx == 7'd80) begin
-                        sp <= 7'd0;
-
-                        if (empty_count == 7'd0) begin
-                            done  <= 1'b1;
-                            valid <= 1'b1;
-                            busy  <= 1'b0;
-                            state <= ST_DONE;
-                        end else begin
-                            state <= ST_SOLVE;
-                        end
+                S_VALIDATE: begin
+                    cycles <= cycles + 32'd1;
+                    if (grid[validate_idx] != 4'd0 &&
+                        !is_legal(validate_idx, grid[validate_idx])) begin
+                        invalid <= 1'b1;
+                        solved  <= 1'b0;
+                        done    <= 1'b1;
+                        state   <= S_DONE;
+                    end else if (validate_idx == 7'd80) begin
+                        idx   <= 7'd0;
+                        state <= S_SOLVE;
                     end else begin
-                        check_idx <= check_idx + 7'd1;
+                        validate_idx <= validate_idx + 7'd1;
                     end
                 end
 
-                ST_SOLVE: begin
-                    if (sp >= empty_count) begin
-                        done  <= 1'b1;
-                        valid <= 1'b1;
-                        busy  <= 1'b0;
-                        state <= ST_DONE;
-                    end else if (next_digit[sp] > 4'd9) begin
-                        board[empty_pos[sp]] <= 4'd0;
-                        next_digit[sp]       <= 4'd1;
+                S_SOLVE: begin
+                    cycles <= cycles + 32'd1;
 
-                        if (sp == 7'd0) begin
-                            done  <= 1'b1;
-                            valid <= 1'b0;
-                            busy  <= 1'b0;
-                            state <= ST_FAIL;
-                        end else begin
-                            board[empty_pos[sp - 7'd1]] <= 4'd0;
-                            next_digit[sp - 7'd1]       <= next_digit[sp - 7'd1] + 4'd1;
-                            sp                          <= sp - 7'd1;
-                        end
-                    end else if (is_placement_valid(empty_pos[sp], next_digit[sp])) begin
-                        board[empty_pos[sp]] <= next_digit[sp];
+                    if (cycles >= MAX_CYCLES) begin
+                        invalid <= 1'b0;
+                        solved  <= 1'b0;
+                        done    <= 1'b1;
+                        state   <= S_DONE;
+                    end else if (idx == 7'd81) begin
+                        solved <= 1'b1;
+                        state  <= S_PACK_OUTPUT;
+                    end else if (fixed_cell[idx]) begin
+                        idx <= idx + 7'd1;
+                    end else begin
+                        try_value <= grid[idx] + 4'd1;
+                        state     <= S_TRY_VALUE;
+                    end
+                end
 
-                        if (sp == (empty_count - 7'd1)) begin
-                            done  <= 1'b1;
-                            valid <= 1'b1;
-                            busy  <= 1'b0;
-                            state <= ST_DONE;
+                S_TRY_VALUE: begin
+                    cycles <= cycles + 32'd1;
+
+                    if (cycles >= MAX_CYCLES) begin
+                        invalid <= 1'b0;
+                        solved  <= 1'b0;
+                        done    <= 1'b1;
+                        state   <= S_DONE;
+                    end else if (try_value <= 4'd9) begin
+                        if (is_legal(idx, try_value)) begin
+                            grid[idx] <= try_value;
+                            idx       <= idx + 7'd1;
+                            state     <= S_SOLVE;
                         end else begin
-                            sp                           <= sp + 7'd1;
-                            board[empty_pos[sp + 7'd1]] <= 4'd0;
-                            next_digit[sp + 7'd1]       <= 4'd1;
+                            try_value <= try_value + 4'd1;
                         end
                     end else begin
-                        next_digit[sp] <= next_digit[sp] + 4'd1;
+                        grid[idx] <= 4'd0;
+                        state     <= S_BACKTRACK;
                     end
                 end
 
-                ST_DONE: begin
+                S_BACKTRACK: begin
+                    cycles <= cycles + 32'd1;
+
+                    if (idx == 7'd0) begin
+                        invalid <= 1'b0;
+                        solved  <= 1'b0;
+                        done    <= 1'b1;
+                        state   <= S_DONE;
+                    end else begin
+                        idx   <= idx - 7'd1;
+                        state <= S_BACKTRACK_SKIP;
+                    end
+                end
+
+                S_BACKTRACK_SKIP: begin
+                    cycles <= cycles + 32'd1;
+
+                    if (fixed_cell[idx]) begin
+                        if (idx == 7'd0) begin
+                            invalid <= 1'b0;
+                            solved  <= 1'b0;
+                            done    <= 1'b1;
+                            state   <= S_DONE;
+                        end else begin
+                            idx <= idx - 7'd1;
+                        end
+                    end else begin
+                        state <= S_SOLVE;
+                    end
+                end
+
+                S_PACK_OUTPUT: begin
+                    cycles <= cycles + 32'd1;
+
+                    for (i = 0; i < 81; i = i + 1) begin
+                        solution_out[i*4 +: 4] <= grid[i];
+                    end
+
                     done  <= 1'b1;
-                    valid <= 1'b1;
-                    busy  <= 1'b0;
+                    state <= S_DONE;
                 end
 
-                ST_FAIL: begin
-                    done  <= 1'b1;
-                    valid <= 1'b0;
-                    busy  <= 1'b0;
+                S_DONE: begin
+                    if (!start) begin
+                        state <= S_IDLE;
+                    end
                 end
 
                 default: begin
-                    state <= ST_IDLE;
+                    state <= S_IDLE;
                 end
             endcase
         end
     end
-
 endmodule
-
-`default_nettype wire
